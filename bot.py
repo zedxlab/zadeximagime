@@ -1,6 +1,6 @@
 """
 ZadeXImagine — Telegram AI Image Generation Bot
-Developer: @zade4everbotbot
+Developer: @zade4everbot
 API: CallMissed (https://api.callmissed.com/v1)
 
 Run:
@@ -14,9 +14,11 @@ one and is stored in the database, no restart needed.
 
 import asyncio
 import base64
+import json
 import logging
 import os
 import sqlite3
+import uuid
 from datetime import date, datetime
 from io import BytesIO
 
@@ -38,6 +40,14 @@ BOT_TOKEN = "8853018550:AAEGf61WdSNdDx7UUOhKT7SNxnqXH4RtXYc"
 CALLMISSED_API_KEY = "cm_HOwWI9nXr_8-isyJ9mfZPgo96BYop4aTHcD9UOKOF1U"  # fallback default — can be overridden live via /admin
 API_BASE = "https://api.callmissed.com/v1"
 
+# FreeToChat — used only for flux-2-pro & nano-banana-2 (cheaper/free route)
+FREETOCHAT_URL = "https://api.freetochat.app/api/v1/ai/chat/completions"
+FREETOCHAT_TOKEN = (
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlNTEzZWZkZS0zZDEzLTQ0OGEtODkzMy"
+    "02NzMxY2JjNzljMTAiLCJyb2xlIjoidXNlciIsImlhdCI6MTc4Mjg0NzQ4NywiZXhwIjoxNzg1NDM5"
+    "NDg3fQ.YPqkcOPj_Yyb-ckhRrvFNo_h0lpH2EzxojN9_hHoasc"
+)  # fallback default — can be overridden live via /admin
+
 OWNER_ID = 8558910409
 BOT_NAME = "ZadeXImagine"
 DEV_USERNAME = "zade4everbot"
@@ -47,7 +57,7 @@ DEFAULT_DAILY_LIMIT = 5
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zadeximagine.db")
 
 MODELS = {
-    "nano-banana-pro": "🍌 Nano Banana Pro",
+    "flux-2-pro": "🚀 Flux 2 Pro",
     "nano-banana-2": "🍌 Nano Banana 2",
     "flux-2-dev": "🌊 Flux 2 Dev",
     "flux-2-klein-9b": "🌊 Flux 2 Klein 9B",
@@ -56,6 +66,15 @@ MODELS = {
     "sdxl-lightning": "⚡ SDXL Lightning",
     "dreamshaper-8-lcm": "🎨 Dreamshaper 8 LCM",
 }
+
+# Models routed through FreeToChat instead of CallMissed, with the exact
+# hint string the router expects appended to the prompt.
+FREETOCHAT_MODELS = {
+    "flux-2-pro": "flux pro",
+    "nano-banana-2": "nano banana 2",
+}
+
+DEFAULT_WAITING_MESSAGE = "🎨 Generating with *{model}*..."
 
 SIZES = ["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]
 
@@ -177,6 +196,15 @@ def set_setting(key: str, value: str):
 def get_active_api_key() -> str:
     """Live-overridden key (set via admin panel) takes priority over the hardcoded default."""
     return get_setting("callmissed_api_key") or CALLMISSED_API_KEY
+
+
+def get_active_freetochat_token() -> str:
+    """Live-overridden token (set via admin panel) takes priority over the hardcoded default."""
+    return get_setting("freetochat_token") or FREETOCHAT_TOKEN
+
+
+def get_waiting_message() -> str:
+    return get_setting("waiting_message") or DEFAULT_WAITING_MESSAGE
 
 
 def set_limit(user_id: int, limit: int) -> bool:
@@ -301,7 +329,11 @@ def admin_menu_keyboard():
                 InlineKeyboardButton("🚫 Ban User", callback_data="admin:ask:ban", style="danger"),
                 InlineKeyboardButton("♻️ Unban User", callback_data="admin:ask:unban", style="success"),
             ],
-            [InlineKeyboardButton("🔑 Change API Key", callback_data="admin:ask:apikey", style="primary")],
+            [
+                InlineKeyboardButton("🔑 CallMissed Key", callback_data="admin:ask:apikey", style="primary"),
+                InlineKeyboardButton("🔑 FreeToChat Token", callback_data="admin:ask:ftc_token", style="primary"),
+            ],
+            [InlineKeyboardButton("⏳ Waiting Message", callback_data="admin:ask:waitmsg", style="primary")],
         ]
     )
 
@@ -357,8 +389,17 @@ def mask_key(key: str) -> str:
     return f"{key[:6]}...{key[-4:]}"
 
 
+def render_template(template: str, **kwargs) -> str:
+    """Safely replace {placeholder} tokens without using str.format (avoids
+    crashes if the admin-supplied template contains stray braces)."""
+    out = template
+    for key, val in kwargs.items():
+        out = out.replace("{" + key + "}", str(val))
+    return out
+
+
 async def call_image_api(model: str, prompt: str, size: str):
-    """Returns (image_bytes, error_message)"""
+    """Returns (image_bytes, error_message) — CallMissed provider."""
     url = f"{API_BASE}/images/generations"
     headers = {"Authorization": f"Bearer {get_active_api_key()}", "Content-Type": "application/json"}
     payload = {"model": model, "prompt": prompt, "n": 1, "size": size}
@@ -378,6 +419,62 @@ async def call_image_api(model: str, prompt: str, size: str):
         return None, "⏱ Request timed out. Try again."
     except Exception as e:
         return None, f"Unexpected error: {e}"
+
+
+async def call_freetochat_api(model: str, prompt: str):
+    """Returns (image_url, error_message) — FreeToChat provider (SSE stream)."""
+    hint = FREETOCHAT_MODELS.get(model, model)
+    payload = {
+        "model": "nemotron-3-super",
+        "messages": [{"role": "user", "content": f"Generate an image: {prompt} with {hint}"}],
+        "stream": True,
+        "tools_enabled": False,
+        "web_search_enabled": False,
+        "skill": "image-artist",
+        "conversation_id": str(uuid.uuid4()),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {get_active_freetochat_token()}",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", FREETOCHAT_URL, headers=headers, json=payload) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    return None, f"API Error [{resp.status_code}]: {body.decode(errors='ignore')[:300]}"
+
+                current_event = None
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    if line.startswith("event:"):
+                        current_event = line.split(":", 1)[1].strip()
+                        continue
+                    if line.startswith("data:") and current_event == "image_generated":
+                        raw = line.split(":", 1)[1].strip()
+                        try:
+                            obj = json.loads(raw)
+                            img_url = obj.get("data", {}).get("url")
+                            if img_url:
+                                return img_url, None
+                        except Exception:
+                            continue
+                return None, "No image returned (stream ended without image_generated event)."
+    except httpx.TimeoutException:
+        return None, "⏱ Request timed out. Try again."
+    except Exception as e:
+        return None, f"Unexpected error: {e}"
+
+
+async def generate_image(model: str, prompt: str, size: str):
+    """Unified dispatcher. Returns ((kind, payload), error) where kind is
+    'url' (FreeToChat) or 'bytes' (CallMissed)."""
+    if model in FREETOCHAT_MODELS:
+        result, error = await call_freetochat_api(model, prompt)
+        return ("url", result), error
+    result, error = await call_image_api(model, prompt, size)
+    return ("bytes", result), error
 
 
 # ─────────────────────────────  USER HANDLERS  ─────────────────────────────
@@ -533,9 +630,20 @@ async def handle_admin_callback(query, context, data):
             "ban": "🚫 Send the `user_id` to ban.",
             "unban": "♻️ Send the `user_id` to unban.",
             "apikey": (
-                f"🔑 Current key: `{mask_key(get_active_api_key())}`\n\n"
+                f"🔑 Current CallMissed key: `{mask_key(get_active_api_key())}`\n\n"
                 "Send the new CallMissed API key (e.g. `cm_xxxxxxxx`) to replace it.\n"
                 "This takes effect immediately, no restart needed."
+            ),
+            "ftc_token": (
+                f"🔑 Current FreeToChat token: `{mask_key(get_active_freetochat_token())}`\n\n"
+                "Send the new FreeToChat bearer token (JWT) to replace it.\n"
+                "Used for *Flux 2 Pro* and *Nano Banana 2*. Takes effect immediately."
+            ),
+            "waitmsg": (
+                f"⏳ Current waiting message:\n`{get_waiting_message()}`\n\n"
+                "Send the new message. Available placeholders:\n"
+                "`{model}` `{size}` `{prompt}` `{username}`\n\n"
+                "Markdown (`*bold*`, `_italic_`) is supported."
             ),
         }
         await query.edit_message_text(
@@ -565,8 +673,39 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     action = context.user_data.pop("admin_action")
-    parts = text.strip().split()
 
+    # Free-text actions that must NOT be split/int-parsed
+    if action == "apikey":
+        new_key = text.strip()
+        if len(new_key) < 6:
+            msg = "⚠️ That doesn't look like a valid key. Try again from the admin menu."
+        else:
+            set_setting("callmissed_api_key", new_key)
+            msg = f"🔑 CallMissed key updated to `{mask_key(new_key)}`. Live with immediate effect."
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
+        return
+
+    if action == "ftc_token":
+        new_token = text.strip()
+        if len(new_token) < 10:
+            msg = "⚠️ That doesn't look like a valid token. Try again from the admin menu."
+        else:
+            set_setting("freetochat_token", new_token)
+            msg = f"🔑 FreeToChat token updated to `{mask_key(new_token)}`. Live with immediate effect."
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
+        return
+
+    if action == "waitmsg":
+        new_template = text.strip()
+        if len(new_template) < 2:
+            msg = "⚠️ Message too short. Try again from the admin menu."
+        else:
+            set_setting("waiting_message", new_template)
+            msg = "⏳ Waiting message updated. Live with immediate effect."
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
+        return
+
+    parts = text.strip().split()
     try:
         if action == "setlimit":
             uid, limit = int(parts[0]), int(parts[1])
@@ -588,13 +727,6 @@ async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             uid = int(parts[0])
             ok = set_ban(uid, False)
             msg = f"♻️ `{uid}` has been unbanned." if ok else f"⚠️ User `{uid}` not found."
-        elif action == "apikey":
-            new_key = text.strip()
-            if len(new_key) < 6:
-                msg = "⚠️ That doesn't look like a valid key. Try again from the admin menu."
-            else:
-                set_setting("callmissed_api_key", new_key)
-                msg = f"🔑 API key updated to `{mask_key(new_key)}`. Live with immediate effect."
         else:
             msg = "⚠️ Unknown action."
     except (ValueError, IndexError):
@@ -630,9 +762,16 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text("⚠️ Prompt bahut chhota hai. Phir se bhejo.")
         return
 
-    status_msg = await update.message.reply_text(f"🎨 Generating with *{MODELS.get(model, model)}*...", parse_mode=ParseMode.MARKDOWN)
+    status_text = render_template(
+        get_waiting_message(),
+        model=MODELS.get(model, model),
+        size=size,
+        prompt=prompt,
+        username=display_name(user),
+    )
+    status_msg = await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
 
-    image_bytes, error = await call_image_api(model, prompt, size)
+    (kind, result), error = await generate_image(model, prompt, size)
 
     uname = display_name(user)
 
@@ -652,8 +791,10 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     increment_usage(user.id)
     caption = f"🖼 *{BOT_NAME}*\n👤 {uname}\n🤖 {MODELS.get(model, model)}\n📐 {size}\n📝 {prompt}"
 
+    photo_arg = result if kind == "url" else BytesIO(result)
+
     sent = await update.message.reply_photo(
-        photo=BytesIO(image_bytes),
+        photo=photo_arg,
         caption=caption,
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=after_generate_keyboard(),
