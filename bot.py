@@ -421,8 +421,34 @@ async def call_image_api(model: str, prompt: str, size: str):
         return None, f"Unexpected error: {e}"
 
 
+def _extract_image_url(obj: dict):
+    """Pull an image URL out of a FreeToChat event payload, tolerating a
+    few different shapes the upstream router might use."""
+    data_block = obj.get("data")
+    if not isinstance(data_block, dict):
+        data_block = obj
+    for key in ("url", "image_url"):
+        if data_block.get(key):
+            return data_block[key]
+    images = data_block.get("images")
+    if isinstance(images, list) and images:
+        first = images[0]
+        if isinstance(first, dict):
+            return first.get("url") or first.get("image_url")
+        if isinstance(first, str):
+            return first
+    return None
+
+
 async def call_freetochat_api(model: str, prompt: str):
-    """Returns (image_url, error_message) — FreeToChat provider (SSE stream)."""
+    """Returns (image_url, error_message) — FreeToChat provider (SSE stream).
+
+    Parsing is deliberately tolerant: the documented format pairs an
+    `event:` line with a `data:` line carrying a matching `"type"` field,
+    but we trust the JSON `"type"` field first and only fall back to the
+    `event:` line, since real-world SSE servers are often inconsistent
+    about emitting the `event:` line at all.
+    """
     hint = FREETOCHAT_MODELS.get(model, model)
     payload = {
         "model": "nemotron-3-super",
@@ -437,30 +463,58 @@ async def call_freetochat_api(model: str, prompt: str):
         "Content-Type": "application/json",
         "Authorization": f"Bearer {get_active_freetochat_token()}",
     }
+    seen_types = []
+    last_raw = None
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=180) as client:
             async with client.stream("POST", FREETOCHAT_URL, headers=headers, json=payload) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
                     return None, f"API Error [{resp.status_code}]: {body.decode(errors='ignore')[:300]}"
 
                 current_event = None
-                async for line in resp.aiter_lines():
+                async for raw_line in resp.aiter_lines():
+                    line = raw_line.strip()
                     if not line:
                         continue
+
                     if line.startswith("event:"):
                         current_event = line.split(":", 1)[1].strip()
                         continue
-                    if line.startswith("data:") and current_event == "image_generated":
-                        raw = line.split(":", 1)[1].strip()
-                        try:
-                            obj = json.loads(raw)
-                            img_url = obj.get("data", {}).get("url")
-                            if img_url:
-                                return img_url, None
-                        except Exception:
-                            continue
-                return None, "No image returned (stream ended without image_generated event)."
+
+                    if not line.startswith("data:"):
+                        continue
+
+                    raw = line.split(":", 1)[1].strip()
+                    if raw in ("", "[DONE]"):
+                        continue
+                    last_raw = raw[:300]
+
+                    try:
+                        obj = json.loads(raw)
+                    except Exception:
+                        continue
+
+                    evt_type = obj.get("type") or current_event
+                    if evt_type:
+                        seen_types.append(evt_type)
+
+                    if evt_type == "error":
+                        err_msg = (
+                            (obj.get("data") or {}).get("message")
+                            or obj.get("message")
+                            or json.dumps(obj)[:300]
+                        )
+                        return None, f"Provider error: {err_msg}"
+
+                    if evt_type == "image_generated":
+                        img_url = _extract_image_url(obj)
+                        if img_url:
+                            return img_url, None
+
+                seen = ", ".join(dict.fromkeys(seen_types)) or "none"
+                detail = f" | last data: {last_raw}" if last_raw else ""
+                return None, f"No image returned (stream ended without image_generated event). Events seen: {seen}{detail}"
     except httpx.TimeoutException:
         return None, "⏱ Request timed out. Try again."
     except Exception as e:
@@ -776,16 +830,26 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     uname = display_name(user)
 
     if error:
-        await status_msg.edit_text(f"❌ Generation failed:\n`{error}`", parse_mode=ParseMode.MARKDOWN)
+        safe_error = error.replace("`", "'").replace("*", "")[:600]
+        try:
+            await status_msg.edit_text(f"❌ Generation failed:\n`{safe_error}`", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await status_msg.edit_text(f"❌ Generation failed:\n{safe_error}")
         log_generation(user.id, uname, prompt, model, size, None, "failed", error)
         try:
             await context.bot.send_message(
                 OWNER_ID,
-                f"❌ *Failed generation*\n👤 {uname} (`{user.id}`)\n🤖 {model} | 📐 {size}\n📝 {prompt}\n⚠️ {error}",
+                f"❌ *Failed generation*\n👤 {uname} (`{user.id}`)\n🤖 {model} | 📐 {size}\n📝 {prompt}\n⚠️ `{safe_error}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
         except Exception:
-            pass
+            try:
+                await context.bot.send_message(
+                    OWNER_ID,
+                    f"❌ Failed generation\n👤 {uname} ({user.id})\n🤖 {model} | 📐 {size}\n📝 {prompt}\n⚠️ {safe_error}",
+                )
+            except Exception:
+                pass
         return
 
     increment_usage(user.id)
