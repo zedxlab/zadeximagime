@@ -1,20 +1,25 @@
-"""ZadeXImagine — Telegram AI Image Generation Bot
+"""
+ZadeXImagine — Telegram AI Image Generation Bot
 Developer: @zade4everbot
 API: CallMissed (https://api.callmissed.com/v1)
 
 Run:
     pip install -r requirements.txt
     python bot.py
+
+Token + API key are hardcoded below in CONFIG. API key can also be changed
+live from the admin panel (🔑 Change API Key) — that overrides the hardcoded
+one and is stored in the database, no restart needed.
 """
 
 import asyncio
 import base64
+import html as html_lib
 import json
 import logging
 import os
 import re
 import sqlite3
-import uuid
 from datetime import date, datetime
 from io import BytesIO
 
@@ -31,16 +36,18 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────  CONFIG  ─────────────────────────────
+# 🔑 Hardcode your real values here before running.
 BOT_TOKEN = "8853018550:AAEGf61WdSNdDx7UUOhKT7SNxnqXH4RtXYc"
-CALLMISSED_API_KEY = "cm_HOwWI9nXr_8-isyJ9mfZPgo96BYop4aTHcD9UOKOF1U"
+CALLMISSED_API_KEY = "cm_HOwWI9nXr_8-isyJ9mfZPgo96BYop4aTHcD9UOKOF1U"  # fallback default — can be overridden live via /admin
 API_BASE = "https://api.callmissed.com/v1"
 
+# FreeToChat — used only for flux-2-pro & nano-banana-2 (cheaper/free route)
 FREETOCHAT_URL = "https://api.freetochat.app/api/v1/ai/chat/completions"
 FREETOCHAT_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlNTEzZWZkZS0zZDEzLTQ0OGEtODkzMy"
     "02NzMxY2JjNzljMTAiLCJyb2xlIjoidXNlciIsImlhdCI6MTc4Mjg0NzQ4NywiZXhwIjoxNzg1NDM5"
     "NDg3fQ.YPqkcOPj_Yyb-ckhRrvFNo_h0lpH2EzxojN9_hHoasc"
-)
+)  # fallback default — can be overridden live via /admin
 
 OWNER_ID = 8558910409
 BOT_NAME = "ZadeXImagine"
@@ -61,9 +68,35 @@ MODELS = {
     "dreamshaper-8-lcm": "🎨 Dreamshaper 8 LCM",
 }
 
+# Models routed through FreeToChat instead of CallMissed, with the exact
+# hint string the router expects appended to the prompt.
 FREETOCHAT_MODELS = {
     "flux-2-pro": "flux pro",
     "nano-banana-2": "nano banana 2",
+}
+
+# The underlying FreeToChat *chat* model used to drive the image-artist skill
+# (i.e. the "model" field in the /chat/completions payload — NOT the image
+# model above, which is just a hint in the prompt text). Admin can switch
+# this live from /admin without touching code.
+DEFAULT_FREETOCHAT_CHAT_MODEL = "kimi-k2.7-code"
+
+FREETOCHAT_CHAT_MODELS = {
+    "kimi-k2.7-code": "Kimi K2.7 Code",
+    "sarvam-30b": "Sarvam 30B",
+    "kimi-k2.6": "Kimi K2.6",
+    "kimi-k2.5": "Kimi K2.5",
+    "gpt-oss-120b": "GPT-OSS 120B",
+    "nemotron-3-super": "Nemotron 3 Super",
+    "glm-4.7-flash": "GLM 4.7 Flash",
+    "glm-5.2": "GLM 5.2",
+    "gemma-4-26b-a4b-it": "Gemma 4 26B",
+    "gpt-4o": "GPT-4o",
+    "gpt-4.1": "GPT-4.1",
+    "gpt-5-mini": "GPT-5 Mini",
+    "grok-4.3": "Grok 4.3",
+    "DeepSeek-V4-Pro": "DeepSeek V4 Pro",
+    "DeepSeek-V4-Flash": "DeepSeek V4 Flash",
 }
 
 DEFAULT_WAITING_MESSAGE = "🎨 Generating with *{model}*..."
@@ -72,20 +105,19 @@ SIZES = ["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]
 
 HISTORY_PAGE_SIZE = 5
 USERS_PAGE_SIZE = 8
-MAX_HISTORY = 10
-STREAM_EDIT_INTERVAL = 0.5
-MAX_RETRIES = 3
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 log = logging.getLogger("ZadeXImagine")
 
+
 # ─────────────────────────────  DATABASE  ─────────────────────────────
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = db()
@@ -122,6 +154,7 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def get_or_create_user(user_id: int, username: str) -> sqlite3.Row:
     conn = db()
     row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -135,23 +168,27 @@ def get_or_create_user(user_id: int, username: str) -> sqlite3.Row:
         conn.commit()
         row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
     else:
+        # reset daily counter if date changed
         if row["last_reset"] != today:
             conn.execute(
                 "UPDATE users SET used_today=0, last_reset=? WHERE user_id=?", (today, user_id)
             )
             conn.commit()
             row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        # keep username fresh
         if username and row["username"] != username:
             conn.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
             conn.commit()
     conn.close()
     return row
 
+
 def increment_usage(user_id: int):
     conn = db()
     conn.execute("UPDATE users SET used_today = used_today + 1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
+
 
 def log_generation(user_id, username, prompt, model, size, file_id, status, error=None):
     conn = db()
@@ -163,11 +200,13 @@ def log_generation(user_id, username, prompt, model, size, file_id, status, erro
     conn.commit()
     conn.close()
 
+
 def get_setting(key: str, default=None):
     conn = db()
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     conn.close()
     return row["value"] if row else default
+
 
 def set_setting(key: str, value: str):
     conn = db()
@@ -178,14 +217,32 @@ def set_setting(key: str, value: str):
     conn.commit()
     conn.close()
 
+
 def get_active_api_key() -> str:
+    """Live-overridden key (set via admin panel) takes priority over the hardcoded default."""
     return get_setting("callmissed_api_key") or CALLMISSED_API_KEY
 
+
 def get_active_freetochat_token() -> str:
+    """Live-overridden token (set via admin panel) takes priority over the hardcoded default."""
     return get_setting("freetochat_token") or FREETOCHAT_TOKEN
+
+
+def get_active_freetochat_chat_model() -> str:
+    """Live-switched FreeToChat chat model (admin panel) — falls back to the default."""
+    stored = get_setting("freetochat_chat_model")
+    if stored and stored in FREETOCHAT_CHAT_MODELS:
+        return stored
+    return DEFAULT_FREETOCHAT_CHAT_MODEL
+
+
+def set_active_freetochat_chat_model(model_id: str):
+    set_setting("freetochat_chat_model", model_id)
+
 
 def get_waiting_message() -> str:
     return get_setting("waiting_message") or DEFAULT_WAITING_MESSAGE
+
 
 def set_limit(user_id: int, limit: int) -> bool:
     conn = db()
@@ -195,6 +252,7 @@ def set_limit(user_id: int, limit: int) -> bool:
     conn.close()
     return ok
 
+
 def set_vip(user_id: int, vip: bool) -> bool:
     conn = db()
     cur = conn.execute("UPDATE users SET is_vip=? WHERE user_id=?", (1 if vip else 0, user_id))
@@ -202,6 +260,7 @@ def set_vip(user_id: int, vip: bool) -> bool:
     ok = cur.rowcount > 0
     conn.close()
     return ok
+
 
 def set_ban(user_id: int, banned: bool) -> bool:
     conn = db()
@@ -211,7 +270,8 @@ def set_ban(user_id: int, banned: bool) -> bool:
     conn.close()
     return ok
 
-def get_history_db(offset: int, limit: int = HISTORY_PAGE_SIZE):
+
+def get_history(offset: int, limit: int = HISTORY_PAGE_SIZE):
     conn = db()
     rows = conn.execute(
         "SELECT * FROM generations ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset)
@@ -219,6 +279,7 @@ def get_history_db(offset: int, limit: int = HISTORY_PAGE_SIZE):
     total = conn.execute("SELECT COUNT(*) c FROM generations").fetchone()["c"]
     conn.close()
     return rows, total
+
 
 def get_users_page(offset: int, limit: int = USERS_PAGE_SIZE):
     conn = db()
@@ -228,6 +289,7 @@ def get_users_page(offset: int, limit: int = USERS_PAGE_SIZE):
     total = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
     conn.close()
     return rows, total
+
 
 def get_stats():
     conn = db()
@@ -247,14 +309,17 @@ def get_stats():
         "today_gens": today_gens,
     }
 
+
 # ─────────────────────────────  KEYBOARDS  ─────────────────────────────
 def dev_button_row():
     return [InlineKeyboardButton("👨‍💻 Developer", url=DEV_URL, style="primary")]
+
 
 def main_menu_keyboard():
     rows = [[InlineKeyboardButton("🎨 Generate Image", callback_data="gen:start", style="success")]]
     rows.append(dev_button_row())
     return InlineKeyboardMarkup(rows)
+
 
 def models_keyboard():
     items = list(MODELS.items())
@@ -267,6 +332,7 @@ def models_keyboard():
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="gen:cancel", style="danger")])
     return InlineKeyboardMarkup(rows)
 
+
 def sizes_keyboard():
     rows = []
     for i in range(0, len(SIZES), 2):
@@ -276,10 +342,12 @@ def sizes_keyboard():
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="gen:cancel", style="danger")])
     return InlineKeyboardMarkup(rows)
 
+
 def after_generate_keyboard():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔁 Generate Another", callback_data="gen:start", style="success")]]
     )
+
 
 def admin_menu_keyboard():
     return InlineKeyboardMarkup(
@@ -287,7 +355,9 @@ def admin_menu_keyboard():
             [InlineKeyboardButton("📊 History", callback_data="admin:history:0", style="primary")],
             [InlineKeyboardButton("👥 Users", callback_data="admin:users:0", style="primary")],
             [InlineKeyboardButton("📈 Stats", callback_data="admin:stats", style="primary")],
-            [InlineKeyboardButton("⏱ Set Limit", callback_data="admin:ask:setlimit", style="primary")],
+            [
+                InlineKeyboardButton("⏱ Set Limit", callback_data="admin:ask:setlimit", style="primary"),
+            ],
             [
                 InlineKeyboardButton("✅ Grant VIP", callback_data="admin:ask:vip", style="success"),
                 InlineKeyboardButton("❌ Revoke VIP", callback_data="admin:ask:unvip", style="danger"),
@@ -304,10 +374,12 @@ def admin_menu_keyboard():
         ]
     )
 
+
 def back_to_admin_menu():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin:menu", style="primary")]]
     )
+
 
 def history_nav_keyboard(offset, total):
     btns = []
@@ -323,6 +395,7 @@ def history_nav_keyboard(offset, total):
     rows.append([InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin:menu", style="primary")])
     return InlineKeyboardMarkup(rows)
 
+
 def users_nav_keyboard(offset, total):
     btns = []
     if offset > 0:
@@ -337,41 +410,30 @@ def users_nav_keyboard(offset, total):
     rows.append([InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin:menu", style="primary")])
     return InlineKeyboardMarkup(rows)
 
+
 # ─────────────────────────────  HELPERS  ─────────────────────────────
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
+
 def display_name(user) -> str:
     return f"@{user.username}" if user.username else user.full_name
+
 
 def mask_key(key: str) -> str:
     if not key or len(key) < 8:
         return "****"
     return f"{key[:6]}...{key[-4:]}"
 
+
 def render_template(template: str, **kwargs) -> str:
+    """Safely replace {placeholder} tokens without using str.format (avoids
+    crashes if the admin-supplied template contains stray braces)."""
     out = template
     for key, val in kwargs.items():
         out = out.replace("{" + key + "}", str(val))
     return out
 
-def escape_md(text: str) -> str:
-    chars = r"_*[]()~`>#+-=|{}.!"
-    return re.sub(f"([{re.escape(chars)}])", r"\\\1", text)
-
-def get_conversation_id(context: ContextTypes.DEFAULT_TYPE) -> str:
-    if "conversation_id" not in context.user_data:
-        context.user_data["conversation_id"] = str(uuid.uuid4())
-    return context.user_data["conversation_id"]
-
-def get_history(context: ContextTypes.DEFAULT_TYPE) -> list:
-    return context.user_data.setdefault("history", [])
-
-def add_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
-    history = get_history(context)
-    history.append({"role": role, "content": content})
-    while len(history) > MAX_HISTORY:
-        history.pop(0)
 
 async def call_image_api(model: str, prompt: str, size: str):
     """Returns (image_bytes, error_message) — CallMissed provider."""
@@ -382,20 +444,30 @@ async def call_image_api(model: str, prompt: str, size: str):
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(url, headers=headers, json=payload)
         if resp.status_code != 200:
-            try:
-                err = resp.json().get("error", {}).get("message", resp.text)
-            except Exception:
-                err = resp.text
-            return None, f"API Error [{resp.status_code}]: {err}"
+            return None, (
+                f"HTTP {resp.status_code} from CallMissed.\n\n"
+                f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                f"📄 Response body:\n{resp.text}"
+            )
         data = resp.json()
-        b64 = data["data"][0]["b64_json"]
+        try:
+            b64 = data["data"][0]["b64_json"]
+        except (KeyError, IndexError, TypeError):
+            return None, (
+                f"Unexpected response shape from CallMissed (no data[0].b64_json).\n\n"
+                f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                f"📄 Response body:\n{resp.text}"
+            )
         return base64.b64decode(b64), None
     except httpx.TimeoutException:
-        return None, "⏱ Request timed out. Try again."
+        return None, f"⏱ Request timed out (120s).\n\n📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}"
     except Exception as e:
-        return None, f"Unexpected error: {e}"
+        return None, f"Unexpected exception: {e!r}\n\n📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}"
+
 
 def _extract_image_url(obj: dict):
+    """Pull an image URL out of a FreeToChat event payload, tolerating a
+    few different shapes the upstream router might use."""
     data_block = obj.get("data")
     if not isinstance(data_block, dict):
         data_block = obj
@@ -411,11 +483,16 @@ def _extract_image_url(obj: dict):
             return first
     return None
 
+
 IMAGE_URL_RE = re.compile(
     r'https?://[^\s"\'<>\\]+\.(?:png|jpe?g|webp|gif)(?:\?[^\s"\'<>\\]*)?', re.IGNORECASE
 )
 
+
 def _find_image_url(obj):
+    """Recursively scan a parsed JSON value for the first string that looks
+    like a direct image URL — used as a fallback in case the upstream event
+    name/shape doesn't match the documented 'image_generated' format."""
     if isinstance(obj, str):
         m = IMAGE_URL_RE.search(obj)
         return m.group(0) if m else None
@@ -432,58 +509,47 @@ def _find_image_url(obj):
                 return found
     return None
 
-async def _stream_once(
-    messages: list,
-    conversation_id: str,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    stream_msg,
-):
-    """Single streaming attempt. Returns (image_url, streamed_text, error)."""
+
+async def call_freetochat_api(model: str, prompt: str):
+    """Returns (image_url, error_message) — FreeToChat provider (SSE stream).
+
+    Parsing is deliberately tolerant: rather than requiring an exact
+    `type == "image_generated"` match, every parsed event is scanned
+    (recursively) for any string that looks like a direct image URL. This
+    survives the upstream using a different event name/shape than the
+    documented one (e.g. a `tool_call_end`/`tool_call_result` event instead
+    of `image_generated`), as long as the URL itself shows up somewhere in
+    the payload.
+
+    On failure, the returned error string is a FULL diagnostic dump
+    (exact payload sent + every SSE event received) so the cause can be
+    read straight from the forwarded admin message, no guessing needed.
+    """
+    hint = FREETOCHAT_MODELS.get(model, model)
     payload = {
-        "model": "kimi-k2.7-code",
-        "messages": messages,
+        "model": get_active_freetochat_chat_model(),
+        "messages": [{"role": "user", "content": f"Make {prompt} with {hint}"}],
         "stream": True,
         "tools_enabled": False,
         "web_search_enabled": False,
-        "skill": "default",
-        "conversation_id": conversation_id,
+        "skill": "image-artist",
     }
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {get_active_freetochat_token()}",
     }
-
-    streamed_text = ""
-    image_url = None
-    seen_types = []
+    event_log = []  # every (event_type, raw_json_str) received, in order — no cap
     tool_args = None
-    last_raw = None
-    last_edit = datetime.utcnow()
-
-    def truncate_for_tg(text: str, limit: int = 3900) -> str:
-        if len(text) <= limit:
-            return text
-        return text[: limit - 3] + "..."
-
-    async def maybe_edit(force: bool = False):
-        nonlocal last_edit
-        now = datetime.utcnow()
-        if not force and (now - last_edit).total_seconds() < STREAM_EDIT_INTERVAL:
-            return
-        last_edit = now
-        text = truncate_for_tg(streamed_text) if streamed_text else "✨ Thinking..."
-        try:
-            await stream_msg.edit_text(text)
-        except Exception:
-            pass
-
     try:
         async with httpx.AsyncClient(timeout=180) as client:
             async with client.stream("POST", FREETOCHAT_URL, headers=headers, json=payload) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
-                    return None, streamed_text, f"API Error [{resp.status_code}]: {body.decode(errors='ignore')[:300]}"
+                    return None, (
+                        f"HTTP {resp.status_code} from FreeToChat.\n\n"
+                        f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                        f"📄 Response body:\n{body.decode(errors='ignore')}"
+                    )
 
                 current_event = None
                 async for raw_line in resp.aiter_lines():
@@ -501,16 +567,15 @@ async def _stream_once(
                     raw = line.split(":", 1)[1].strip()
                     if raw in ("", "[DONE]"):
                         continue
-                    last_raw = raw[:400]
 
                     try:
                         obj = json.loads(raw)
                     except Exception:
+                        event_log.append((current_event or "unparsed", raw))
                         continue
 
                     evt_type = obj.get("type") or current_event
-                    if evt_type:
-                        seen_types.append(evt_type)
+                    event_log.append((evt_type or "unknown", raw))
 
                     if evt_type == "tool_call_start" and tool_args is None:
                         tool_args = (obj.get("data") or {}).get("args")
@@ -519,148 +584,63 @@ async def _stream_once(
                         err_msg = (
                             (obj.get("data") or {}).get("message")
                             or obj.get("message")
-                            or json.dumps(obj)[:300]
+                            or json.dumps(obj)
                         )
-                        return None, streamed_text, f"Provider error: {err_msg}"
+                        return None, (
+                            f"Provider returned an error event.\n\n"
+                            f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                            f"⚠️ Error: {err_msg}\n\n"
+                            f"📡 Full event log:\n" + _format_event_log(event_log)
+                        )
 
+                    # Primary path: documented shape
                     if evt_type == "image_generated":
                         img_url = _extract_image_url(obj) or _find_image_url(obj)
                         if img_url:
-                            image_url = img_url
+                            return img_url, None
 
-                    if not image_url and evt_type in ("tool_call_result", "tool_call_end", "tool_result"):
-                        img_url = _extract_image_url(obj) or _find_image_url(obj)
-                        if img_url:
-                            image_url = img_url
+                    # Fallback path: any event carrying an image URL, regardless of type name
+                    img_url = _find_image_url(obj)
+                    if img_url:
+                        return img_url, None
 
-                    choices = obj.get("choices")
-                    if isinstance(choices, list) and choices:
-                        delta = choices[0].get("delta", {})
-                        if "reasoning_content" in delta:
-                            streamed_text += delta["reasoning_content"]
-                        if "content" in delta:
-                            streamed_text += delta["content"]
-                        await maybe_edit()
-
-                    if not image_url:
-                        img_url = _find_image_url(obj)
-                        if img_url:
-                            image_url = img_url
-
-                    if image_url:
-                        await asyncio.sleep(0.3)
-                        await maybe_edit(force=True)
-                        break
-
-                if not image_url:
-                    seen = ", ".join(dict.fromkeys(seen_types)) or "none"
-                    detail = f" | last data: {last_raw}" if last_raw else ""
-                    args_info = f" | tool args: {json.dumps(tool_args)[:200]}" if tool_args else ""
-                    return None, streamed_text, f"No image URL found in stream. Events seen: {seen}{detail}{args_info}"
-
-                return image_url, streamed_text, None
-
-    except httpx.TimeoutException:
-        return None, streamed_text, "⏱ Request timed out. Try again."
-    except Exception as e:
-        return None, streamed_text, f"Unexpected error: {e}"
-
-async def call_freetochat_streaming(
-    model: str,
-    messages: list,
-    conversation_id: str,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-):
-    """Stream with retries. On failure, retry with a fresh conversation."""
-    stream_msg = await context.bot.send_message(chat_id, "✨ Thinking...")
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        use_messages = messages if attempt == 1 else [messages[-1]] if messages else messages
-        use_conv_id = conversation_id if attempt == 1 else str(uuid.uuid4())
-
-        image_url, streamed_text, error = await _stream_once(
-            use_messages, use_conv_id, context, chat_id, stream_msg
-        )
-
-        if image_url:
-            return image_url, streamed_text, stream_msg, None
-
-        if attempt < MAX_RETRIES:
-            try:
-                await stream_msg.edit_text(f"⚠️ Attempt {attempt} failed, retrying...")
-            except Exception:
-                pass
-            await asyncio.sleep(1.5)
-
-    return None, streamed_text, stream_msg, error
-
-async def generate_image(model: str, prompt: str, size: str, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Unified dispatcher. Returns ((kind, payload), stream_msg, streamed_text, error)."""
-    if model in FREETOCHAT_MODELS:
-        hint = FREETOCHAT_MODELS[model]
-        user_content = f"Make {prompt} with {hint}"
-        add_history(context, "user", user_content)
-        messages = get_history(context)
-        conversation_id = get_conversation_id(context)
-        image_url, streamed_text, stream_msg, error = await call_freetochat_streaming(
-            model, messages, conversation_id, context, chat_id
-        )
-        if not error and image_url:
-            add_history(context, "assistant", f"Generated image: {prompt}")
-        return ("url", image_url), stream_msg, streamed_text, error
-    result, error = await call_image_api(model, prompt, size)
-    return ("bytes", result), None, None, error
-
-# ─────────────────────────────  ANIMATION HELPERS  ─────────────────────────────
-async def _animate_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, base_text: str):
-    dots = ["", ".", "..", "..."]
-    idx = 0
-    try:
-        while True:
-            text = base_text + dots[idx % len(dots)]
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN,
+                return None, (
+                    "No image URL found in stream — full diagnostic dump below.\n\n"
+                    f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+                    f"🔧 tool_call_start args:\n"
+                    f"{json.dumps(tool_args, ensure_ascii=False) if tool_args else 'never received'}\n\n"
+                    f"📡 Full event log ({len(event_log)} events):\n" + _format_event_log(event_log)
                 )
-            except Exception:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text=text,
-                    )
-                except Exception:
-                    pass
-            idx += 1
-            await asyncio.sleep(0.8)
-    except asyncio.CancelledError:
-        pass
+    except httpx.TimeoutException:
+        return None, (
+            f"⏱ Request timed out (180s).\n\n"
+            f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+            f"📡 Events received before timeout ({len(event_log)}):\n" + _format_event_log(event_log)
+        )
+    except Exception as e:
+        return None, (
+            f"Unexpected exception: {e!r}\n\n"
+            f"📦 Payload sent:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+            f"📡 Events received before exception ({len(event_log)}):\n" + _format_event_log(event_log)
+        )
 
-async def _keep_typing_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    try:
-        while True:
-            try:
-                await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            except Exception:
-                pass
-            await asyncio.sleep(4)
-    except asyncio.CancelledError:
-        pass
 
-async def _keep_upload_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    try:
-        while True:
-            try:
-                await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-            except Exception:
-                pass
-            await asyncio.sleep(4)
-    except asyncio.CancelledError:
-        pass
+def _format_event_log(event_log) -> str:
+    """Render the full (event_type, raw_json) list as readable lines, untruncated."""
+    if not event_log:
+        return "(no events received)"
+    return "\n".join(f"[{i+1}] event={etype}\n    data={raw}" for i, (etype, raw) in enumerate(event_log))
+
+
+async def generate_image(model: str, prompt: str, size: str):
+    """Unified dispatcher. Returns ((kind, payload), error) where kind is
+    'url' (FreeToChat) or 'bytes' (CallMissed)."""
+    if model in FREETOCHAT_MODELS:
+        result, error = await call_freetochat_api(model, prompt)
+        return ("url", result), error
+    result, error = await call_image_api(model, prompt, size)
+    return ("bytes", result), error
+
 
 # ─────────────────────────────  USER HANDLERS  ─────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -674,6 +654,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
 
+
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -686,16 +667,18 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
 
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
     user = query.from_user
 
+    # ── Generation flow ──
     if data == "gen:start":
         context.user_data.pop("awaiting_prompt", None)
         await query.edit_message_text(
-            "🤖 *Step 1/2 — Choose a model:*", parse_mode=ParseMode.MARKDOWN, reply_markup=models_keyboard()
+            "🤖 *Step 1/3 — Choose a model:*", parse_mode=ParseMode.MARKDOWN, reply_markup=models_keyboard()
         )
         return
 
@@ -709,19 +692,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["model"] = model_id
 
         if model_id in FREETOCHAT_MODELS:
-            context.user_data["size"] = "direct"
+            # These models don't support custom size/negative_prompt upstream —
+            # asking for a size just tempts the router to pass one along and
+            # break the generation. Skip straight to the prompt step.
+            context.user_data["size"] = None
             context.user_data["awaiting_prompt"] = True
             await query.edit_message_text(
                 f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n"
                 "✍️ *Step 2/2 — Send your prompt now* as a text message.",
                 parse_mode=ParseMode.MARKDOWN,
             )
-        else:
-            await query.edit_message_text(
-                f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n📐 *Step 2/3 — Choose a size:*",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=sizes_keyboard(),
-            )
+            return
+
+        await query.edit_message_text(
+            f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n📐 *Step 2/3 — Choose a size:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=sizes_keyboard(),
+        )
         return
 
     if data.startswith("size:"):
@@ -736,9 +723,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ── Admin flow ──
     if data.startswith("admin:") and is_owner(user.id):
         await handle_admin_callback(query, context, data)
         return
+
 
 async def handle_admin_callback(query, context, data):
     parts = data.split(":")
@@ -770,7 +759,7 @@ async def handle_admin_callback(query, context, data):
 
     if action == "history":
         offset = int(parts[2])
-        rows, total = get_history_db(offset)
+        rows, total = get_history(offset)
         if not rows:
             await query.edit_message_text("📭 No generations yet.", reply_markup=back_to_admin_menu())
             return
@@ -841,14 +830,17 @@ async def handle_admin_callback(query, context, data):
         )
         return
 
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg_text = update.message.text or ""
 
+    # ── Admin pending action ──
     if is_owner(user.id) and context.user_data.get("admin_action"):
         await process_admin_input(update, context, msg_text)
         return
 
+    # ── Awaiting image prompt ──
     if context.user_data.get("awaiting_prompt"):
         await process_generation(update, context, msg_text)
         return
@@ -857,9 +849,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 /start se shuru karo, ya neeche button dabao.", reply_markup=main_menu_keyboard()
     )
 
+
 async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     action = context.user_data.pop("admin_action")
 
+    # Free-text actions that must NOT be split/int-parsed
     if action == "apikey":
         new_key = text.strip()
         if len(new_key) < 6:
@@ -919,23 +913,59 @@ async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
 
+
+async def send_full_error_to_owner(bot, header_html: str, full_text: str):
+    """Sends a complete, untruncated diagnostic dump to the owner.
+
+    Short dumps go as one or more <pre> code-block messages (HTML-escaped,
+    so JSON braces/quotes/newlines in the payload/event log can never break
+    Telegram's parser). Very large dumps go as a .txt file attachment
+    instead of spamming multiple chat messages.
+    """
+    try:
+        await bot.send_message(OWNER_ID, header_html, parse_mode=ParseMode.HTML)
+    except Exception:
+        try:
+            await bot.send_message(OWNER_ID, re.sub(r"<[^>]+>", "", header_html))
+        except Exception:
+            pass
+
+    if len(full_text) > 12000:
+        try:
+            await bot.send_document(
+                OWNER_ID,
+                document=BytesIO(full_text.encode("utf-8")),
+                filename="zadeximagine_error_dump.txt",
+                caption="📄 Full diagnostic dump (too long for chat messages)",
+            )
+        except Exception:
+            pass
+        return
+
+    escaped = html_lib.escape(full_text)
+    chunk_size = 3500
+    chunks = [escaped[i : i + chunk_size] for i in range(0, len(escaped), chunk_size)] or [""]
+    for chunk in chunks:
+        try:
+            await bot.send_message(OWNER_ID, f"<pre>{chunk}</pre>", parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await bot.send_message(OWNER_ID, chunk[:4000])
+            except Exception:
+                pass
+
+
 async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     context.user_data["awaiting_prompt"] = False
     user = update.effective_user
     model = context.user_data.get("model")
-    size = context.user_data.get("size")
+    size = context.user_data.get("size")  # None is valid for FreeToChat-routed models
 
-    if not model:
+    if not model or (model not in FREETOCHAT_MODELS and not size):
         await update.message.reply_text("⚠️ Session expired. /start se phir try karo.")
         return
 
-    is_direct = model in FREETOCHAT_MODELS
-    if not is_direct and not size:
-        await update.message.reply_text("⚠️ Session expired. /start se phir try karo.")
-        return
-
-    if is_direct:
-        size = size or "direct"
+    size_display = size or "auto"
 
     row = get_or_create_user(user.id, user.username or "")
 
@@ -957,105 +987,58 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     status_text = render_template(
         get_waiting_message(),
         model=MODELS.get(model, model),
-        size=size,
+        size=size_display,
         prompt=prompt,
         username=display_name(user),
     )
-    try:
-        status_msg = await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        status_msg = await update.message.reply_text(status_text)
+    status_msg = await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
 
-    chat_id = update.effective_chat.id
-
-    animate_task = asyncio.create_task(
-        _animate_status(context, status_msg.chat_id, status_msg.message_id, status_text)
-    )
-    typing_task = asyncio.create_task(
-        _keep_typing_action(context, chat_id)
-    )
-
-    try:
-        (kind, result), stream_msg, streamed_text, error = await generate_image(
-            model, prompt, size, context, chat_id
-        )
-    finally:
-        animate_task.cancel()
-        typing_task.cancel()
-        try:
-            await animate_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+    (kind, result), error = await generate_image(model, prompt, size)
 
     uname = display_name(user)
 
     if error:
-        safe_error = error.replace("`", "'").replace("*", "")[:600]
+        # Short, clean summary for the user — first line only, no raw payload noise.
+        user_summary = error.split("\n")[0][:300]
         try:
-            await status_msg.edit_text(f"❌ Generation failed:\n`{safe_error}`", parse_mode=ParseMode.MARKDOWN)
+            await status_msg.edit_text(f"❌ Generation failed:\n{user_summary}")
         except Exception:
-            await status_msg.edit_text(f"❌ Generation failed:\n{safe_error}")
+            pass
+
         log_generation(user.id, uname, prompt, model, size, None, "failed", error)
-        try:
-            await context.bot.send_message(
-                OWNER_ID,
-                f"❌ *Failed generation*\n👤 {uname} (`{user.id}`)\n🤖 {model} | 📐 {size}\n📝 {prompt}\n⚠️ `{safe_error}`",
-                parse_mode=ParseMode.MARKDOWN,
-            )
-        except Exception:
-            try:
-                await context.bot.send_message(
-                    OWNER_ID,
-                    f"❌ Failed generation\n👤 {uname} ({user.id})\n🤖 {model} | 📐 {size}\n📝 {prompt}\n⚠️ {safe_error}",
-                )
-            except Exception:
-                pass
+
+        header_html = (
+            "❌ <b>Failed generation — full diagnostic</b>\n"
+            f"👤 {html_lib.escape(uname)} (<code>{user.id}</code>)\n"
+            f"🤖 {html_lib.escape(str(model))} | 📐 {html_lib.escape(str(size_display))}\n"
+            f"📝 {html_lib.escape(prompt)}"
+        )
+        await send_full_error_to_owner(context.bot, header_html, error)
         return
 
     increment_usage(user.id)
+    caption = f"🖼 *{BOT_NAME}*\n👤 {uname}\n🤖 {MODELS.get(model, model)}\n📐 {size_display}\n📝 {prompt}"
 
-    size_line = f"\n📐 {size}" if size and size != "direct" else ""
-    caption = f"🖼 *{BOT_NAME}*\n👤 {uname}\n🤖 {MODELS.get(model, model)}{size_line}\n📝 {prompt}"
+    photo_arg = result if kind == "url" else BytesIO(result)
 
-    upload_task = asyncio.create_task(_keep_upload_action(context, chat_id))
-    try:
-        photo_arg = result if kind == "url" else BytesIO(result)
-        sent = await update.message.reply_photo(
-            photo=photo_arg,
-            caption=caption,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=after_generate_keyboard(),
-        )
-    finally:
-        upload_task.cancel()
-        try:
-            await upload_task
-        except asyncio.CancelledError:
-            pass
-
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-    if stream_msg:
-        try:
-            await stream_msg.delete()
-        except Exception:
-            pass
+    sent = await update.message.reply_photo(
+        photo=photo_arg,
+        caption=caption,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=after_generate_keyboard(),
+    )
+    await status_msg.delete()
 
     file_id = sent.photo[-1].file_id
     log_generation(user.id, uname, prompt, model, size, file_id, "success")
 
+    # forward to admin
     if user.id != OWNER_ID:
         try:
             await context.bot.send_photo(
                 OWNER_ID,
                 photo=file_id,
-                caption=f"📥 *New generation*\n👤 {uname} (`{user.id}`)\n🤖 {model}{size_line}\n📝 {prompt}",
+                caption=f"📥 *New generation*\n👤 {uname} (`{user.id}`)\n🤖 {model}\n📐 {size_display}\n📝 {prompt}",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("👤 Open Chat", url=f"tg://user?id={user.id}", style="primary")]]
@@ -1064,7 +1047,9 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             log.warning(f"Failed to forward to admin: {e}")
 
-    context.user_data.pop("awaiting_prompt", None)
+    context.user_data.pop("model", None)
+    context.user_data.pop("size", None)
+
 
 # ─────────────────────────────  MAIN  ─────────────────────────────
 def main():
@@ -1082,6 +1067,7 @@ def main():
 
     log.info(f"{BOT_NAME} starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
