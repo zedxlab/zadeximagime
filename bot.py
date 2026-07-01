@@ -57,8 +57,8 @@ DEFAULT_DAILY_LIMIT = 5
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zadeximagine.db")
 
 MODELS = {
-    "flux-2-pro": "🚀 Flux 2 Pro (Direct)",
-    "nano-banana-2": "🍌 Nano Banana 2 (Direct)",
+    "flux-2-pro": "🚀 Flux 2 Pro",
+    "nano-banana-2": "🍌 Nano Banana 2",
     "flux-2-dev": "🌊 Flux 2 Dev",
     "flux-2-klein-9b": "🌊 Flux 2 Klein 9B",
     "lucid-origin": "✨ Lucid Origin",
@@ -81,7 +81,8 @@ SIZES = ["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]
 HISTORY_PAGE_SIZE = 5
 USERS_PAGE_SIZE = 8
 
-MAX_HISTORY = 10
+# Conversation history kept for FreeToChat direct models (gpt-4.1 + image-artist)
+MAX_HISTORY_MESSAGES = 10
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -370,6 +371,21 @@ def render_template(template: str, **kwargs) -> str:
         out = out.replace("{" + key + "}", str(val))
     return out
 
+def get_conversation_id(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Re-use the same conversation_id so FreeToChat keeps context."""
+    if "conversation_id" not in context.user_data:
+        context.user_data["conversation_id"] = str(uuid.uuid4())
+    return context.user_data["conversation_id"]
+
+def get_history(context: ContextTypes.DEFAULT_TYPE) -> list:
+    return context.user_data.setdefault("history", [])
+
+def add_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
+    history = get_history(context)
+    history.append({"role": role, "content": content})
+    while len(history) > MAX_HISTORY_MESSAGES:
+        history.pop(0)
+
 async def call_image_api(model: str, prompt: str, size: str):
     """Returns (image_bytes, error_message) — CallMissed provider."""
     url = f"{API_BASE}/images/generations"
@@ -434,31 +450,19 @@ def _find_image_url(obj):
                 return found
     return None
 
-async def call_freetochat_api(model: str, prompt: str):
+async def call_freetochat_api(model: str, messages: list, conversation_id: str):
     """Returns (image_url, error_message) — FreeToChat provider (SSE stream).
 
-    Parsing is deliberately tolerant: rather than requiring an exact
-    `type == "image_generated"` match, every parsed event is scanned
-    (recursively) for any string that looks like a direct image URL. This
-    survives the upstream using a different event name/shape than the
-    documented one (e.g. a `tool_call_end`/`tool_call_result` event instead
-    of `image_generated`), as long as the URL itself shows up somewhere in
-    the payload.
+    Uses gpt-4.1 + image-artist always. Does not expose reasoning to the UI.
     """
-    hint = FREETOCHAT_MODELS.get(model, model)
     payload = {
         "model": "gpt-4.1",
-        "messages": [
-            {
-                "role": "user",
-                "content": f"Make {prompt} using {hint} image model"
-            }
-        ],
+        "messages": messages,
         "stream": True,
         "tools_enabled": False,
         "web_search_enabled": False,
         "skill": "image-artist",
-        "conversation_id": str(uuid.uuid4()),
+        "conversation_id": conversation_id,
     }
     headers = {
         "Content-Type": "application/json",
@@ -532,14 +536,63 @@ async def call_freetochat_api(model: str, prompt: str):
     except Exception as e:
         return None, f"Unexpected error: {e}"
 
-async def generate_image(model: str, prompt: str, size: str):
+async def generate_image(model: str, prompt: str, size: str, context: ContextTypes.DEFAULT_TYPE):
     """Unified dispatcher. Returns ((kind, payload), error) where kind is
     'url' (FreeToChat) or 'bytes' (CallMissed)."""
     if model in FREETOCHAT_MODELS:
-        result, error = await call_freetochat_api(model, prompt)
+        hint = FREETOCHAT_MODELS[model]
+        user_content = f"Make {prompt} using {hint} image model"
+        add_history(context, "user", user_content)
+        messages = get_history(context)
+        conversation_id = get_conversation_id(context)
+        result, error = await call_freetochat_api(model, messages, conversation_id)
+        if not error:
+            add_history(context, "assistant", f"Here is the generated image: {prompt}")
         return ("url", result), error
     result, error = await call_image_api(model, prompt, size)
     return ("bytes", result), error
+
+# ─────────────────────────────  ANIMATION HELPERS  ─────────────────────────────
+async def _animate_status(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, base_text: str):
+    """Edits the status message with an animated dot cycle."""
+    dots = ["", ".", "..", "..."]
+    idx = 0
+    try:
+        while True:
+            text = base_text + dots[idx % len(dots)]
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                # If markdown breaks because of admin template, fall back to plain text
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                    )
+                except Exception:
+                    pass
+            idx += 1
+            await asyncio.sleep(0.8)
+    except asyncio.CancelledError:
+        pass
+
+async def _keep_upload_action(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Keeps the 'uploading photo' chat action alive during generation."""
+    try:
+        while True:
+            try:
+                await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+            except Exception:
+                pass
+            await asyncio.sleep(4)
+    except asyncio.CancelledError:
+        pass
 
 # ─────────────────────────────  USER HANDLERS  ─────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -588,8 +641,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         model_id = data.split(":", 1)[1]
         context.user_data["model"] = model_id
 
-        # Direct prompts for flux-2-pro and nano-banana-2
-        if model_id in ("flux-2-pro", "nano-banana-2"):
+        # Direct FreeToChat models skip size selection
+        if model_id in FREETOCHAT_MODELS:
+            context.user_data["size"] = "direct"
             context.user_data["awaiting_prompt"] = True
             await query.edit_message_text(
                 f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n"
@@ -809,9 +863,17 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     model = context.user_data.get("model")
     size = context.user_data.get("size")
 
-    if not model or not size:
+    if not model:
         await update.message.reply_text("⚠️ Session expired. /start se phir try karo.")
         return
+
+    is_direct = model in FREETOCHAT_MODELS
+    if not is_direct and not size:
+        await update.message.reply_text("⚠️ Session expired. /start se phir try karo.")
+        return
+
+    if is_direct:
+        size = size or "direct"
 
     row = get_or_create_user(user.id, user.username or "")
 
@@ -837,9 +899,32 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         prompt=prompt,
         username=display_name(user),
     )
-    status_msg = await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+    try:
+        status_msg = await update.message.reply_text(status_text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        status_msg = await update.message.reply_text(status_text)
 
-    (kind, result), error = await generate_image(model, prompt, size)
+    # Start animated status + upload action
+    animate_task = asyncio.create_task(
+        _animate_status(context, status_msg.chat_id, status_msg.message_id, status_text)
+    )
+    action_task = asyncio.create_task(
+        _keep_upload_action(context, update.effective_chat.id)
+    )
+
+    try:
+        (kind, result), error = await generate_image(model, prompt, size, context)
+    finally:
+        animate_task.cancel()
+        action_task.cancel()
+        try:
+            await animate_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await action_task
+        except asyncio.CancelledError:
+            pass
 
     uname = display_name(user)
 
@@ -867,7 +952,9 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return
 
     increment_usage(user.id)
-    caption = f"🖼 *{BOT_NAME}*\n👤 {uname}\n🤖 {MODELS.get(model, model)}\n📐 {size}\n📝 {prompt}"
+
+    size_line = f"\n📐 {size}" if size and size != "direct" else ""
+    caption = f"🖼 *{BOT_NAME}*\n👤 {uname}\n🤖 {MODELS.get(model, model)}{size_line}\n📝 {prompt}"
 
     photo_arg = result if kind == "url" else BytesIO(result)
 
@@ -888,7 +975,7 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
             await context.bot.send_photo(
                 OWNER_ID,
                 photo=file_id,
-                caption=f"📥 *New generation*\n👤 {uname} (`{user.id}`)\n🤖 {model}\n📐 {size}\n📝 {prompt}",
+                caption=f"📥 *New generation*\n👤 {uname} (`{user.id}`)\n🤖 {model}{size_line}\n📝 {prompt}",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup(
                     [[InlineKeyboardButton("👤 Open Chat", url=f"tg://user?id={user.id}", style="primary")]]
@@ -897,8 +984,8 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception as e:
             log.warning(f"Failed to forward to admin: {e}")
 
-    context.user_data.pop("model", None)
-    context.user_data.pop("size", None)
+    # Keep model/size for "Generate Another" — history persists automatically
+    context.user_data.pop("awaiting_prompt", None)
 
 # ─────────────────────────────  MAIN  ─────────────────────────────
 def main():
