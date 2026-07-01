@@ -1,5 +1,4 @@
-"""
-ZadeXImagine — Telegram AI Image Generation Bot
+"""ZadeXImagine — Telegram AI Image Generation Bot
 Developer: @zade4everbot
 API: CallMissed (https://api.callmissed.com/v1)
 
@@ -58,8 +57,8 @@ DEFAULT_DAILY_LIMIT = 5
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zadeximagine.db")
 
 MODELS = {
-    "flux-2-pro": "🚀 Flux 2 Pro",
-    "nano-banana-2": "🍌 Nano Banana 2",
+    "flux-2-pro": "🚀 Flux 2 Pro (Direct)",
+    "nano-banana-2": "🍌 Nano Banana 2 (Direct)",
     "flux-2-dev": "🌊 Flux 2 Dev",
     "flux-2-klein-9b": "🌊 Flux 2 Klein 9B",
     "lucid-origin": "✨ Lucid Origin",
@@ -82,18 +81,18 @@ SIZES = ["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]
 HISTORY_PAGE_SIZE = 5
 USERS_PAGE_SIZE = 8
 
+MAX_HISTORY = 10
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 log = logging.getLogger("ZadeXImagine")
-
 
 # ─────────────────────────────  DATABASE  ─────────────────────────────
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
 
 def init_db():
     conn = db()
@@ -130,7 +129,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 def get_or_create_user(user_id: int, username: str) -> sqlite3.Row:
     conn = db()
     row = conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -158,13 +156,11 @@ def get_or_create_user(user_id: int, username: str) -> sqlite3.Row:
     conn.close()
     return row
 
-
 def increment_usage(user_id: int):
     conn = db()
     conn.execute("UPDATE users SET used_today = used_today + 1 WHERE user_id=?", (user_id,))
     conn.commit()
     conn.close()
-
 
 def log_generation(user_id, username, prompt, model, size, file_id, status, error=None):
     conn = db()
@@ -176,13 +172,11 @@ def log_generation(user_id, username, prompt, model, size, file_id, status, erro
     conn.commit()
     conn.close()
 
-
 def get_setting(key: str, default=None):
     conn = db()
     row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     conn.close()
     return row["value"] if row else default
-
 
 def set_setting(key: str, value: str):
     conn = db()
@@ -193,20 +187,16 @@ def set_setting(key: str, value: str):
     conn.commit()
     conn.close()
 
-
 def get_active_api_key() -> str:
     """Live-overridden key (set via admin panel) takes priority over the hardcoded default."""
     return get_setting("callmissed_api_key") or CALLMISSED_API_KEY
-
 
 def get_active_freetochat_token() -> str:
     """Live-overridden token (set via admin panel) takes priority over the hardcoded default."""
     return get_setting("freetochat_token") or FREETOCHAT_TOKEN
 
-
 def get_waiting_message() -> str:
     return get_setting("waiting_message") or DEFAULT_WAITING_MESSAGE
-
 
 def set_limit(user_id: int, limit: int) -> bool:
     conn = db()
@@ -216,7 +206,6 @@ def set_limit(user_id: int, limit: int) -> bool:
     conn.close()
     return ok
 
-
 def set_vip(user_id: int, vip: bool) -> bool:
     conn = db()
     cur = conn.execute("UPDATE users SET is_vip=? WHERE user_id=?", (1 if vip else 0, user_id))
@@ -225,7 +214,6 @@ def set_vip(user_id: int, vip: bool) -> bool:
     conn.close()
     return ok
 
-
 def set_ban(user_id: int, banned: bool) -> bool:
     conn = db()
     cur = conn.execute("UPDATE users SET is_banned=? WHERE user_id=?", (1 if banned else 0, user_id))
@@ -233,7 +221,6 @@ def set_ban(user_id: int, banned: bool) -> bool:
     ok = cur.rowcount > 0
     conn.close()
     return ok
-
 
 def get_history(offset: int, limit: int = HISTORY_PAGE_SIZE):
     conn = db()
@@ -244,7 +231,6 @@ def get_history(offset: int, limit: int = HISTORY_PAGE_SIZE):
     conn.close()
     return rows, total
 
-
 def get_users_page(offset: int, limit: int = USERS_PAGE_SIZE):
     conn = db()
     rows = conn.execute(
@@ -253,7 +239,6 @@ def get_users_page(offset: int, limit: int = USERS_PAGE_SIZE):
     total = conn.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
     conn.close()
     return rows, total
-
 
 def get_stats():
     conn = db()
@@ -273,17 +258,14 @@ def get_stats():
         "today_gens": today_gens,
     }
 
-
 # ─────────────────────────────  KEYBOARDS  ─────────────────────────────
 def dev_button_row():
     return [InlineKeyboardButton("👨‍💻 Developer", url=DEV_URL, style="primary")]
-
 
 def main_menu_keyboard():
     rows = [[InlineKeyboardButton("🎨 Generate Image", callback_data="gen:start", style="success")]]
     rows.append(dev_button_row())
     return InlineKeyboardMarkup(rows)
-
 
 def models_keyboard():
     items = list(MODELS.items())
@@ -296,7 +278,6 @@ def models_keyboard():
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="gen:cancel", style="danger")])
     return InlineKeyboardMarkup(rows)
 
-
 def sizes_keyboard():
     rows = []
     for i in range(0, len(SIZES), 2):
@@ -306,12 +287,10 @@ def sizes_keyboard():
     rows.append([InlineKeyboardButton("❌ Cancel", callback_data="gen:cancel", style="danger")])
     return InlineKeyboardMarkup(rows)
 
-
 def after_generate_keyboard():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔁 Generate Another", callback_data="gen:start", style="success")]]
     )
-
 
 def admin_menu_keyboard():
     return InlineKeyboardMarkup(
@@ -338,12 +317,10 @@ def admin_menu_keyboard():
         ]
     )
 
-
 def back_to_admin_menu():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin:menu", style="primary")]]
     )
-
 
 def history_nav_keyboard(offset, total):
     btns = []
@@ -359,7 +336,6 @@ def history_nav_keyboard(offset, total):
     rows.append([InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin:menu", style="primary")])
     return InlineKeyboardMarkup(rows)
 
-
 def users_nav_keyboard(offset, total):
     btns = []
     if offset > 0:
@@ -374,21 +350,17 @@ def users_nav_keyboard(offset, total):
     rows.append([InlineKeyboardButton("⬅️ Admin Menu", callback_data="admin:menu", style="primary")])
     return InlineKeyboardMarkup(rows)
 
-
 # ─────────────────────────────  HELPERS  ─────────────────────────────
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
 
-
 def display_name(user) -> str:
     return f"@{user.username}" if user.username else user.full_name
-
 
 def mask_key(key: str) -> str:
     if not key or len(key) < 8:
         return "****"
     return f"{key[:6]}...{key[-4:]}"
-
 
 def render_template(template: str, **kwargs) -> str:
     """Safely replace {placeholder} tokens without using str.format (avoids
@@ -397,7 +369,6 @@ def render_template(template: str, **kwargs) -> str:
     for key, val in kwargs.items():
         out = out.replace("{" + key + "}", str(val))
     return out
-
 
 async def call_image_api(model: str, prompt: str, size: str):
     """Returns (image_bytes, error_message) — CallMissed provider."""
@@ -421,7 +392,6 @@ async def call_image_api(model: str, prompt: str, size: str):
     except Exception as e:
         return None, f"Unexpected error: {e}"
 
-
 def _extract_image_url(obj: dict):
     """Pull an image URL out of a FreeToChat event payload, tolerating a
     few different shapes the upstream router might use."""
@@ -440,11 +410,9 @@ def _extract_image_url(obj: dict):
             return first
     return None
 
-
 IMAGE_URL_RE = re.compile(
     r'https?://[^\s"\'<>\\]+\.(?:png|jpe?g|webp|gif)(?:\?[^\s"\'<>\\]*)?', re.IGNORECASE
 )
-
 
 def _find_image_url(obj):
     """Recursively scan a parsed JSON value for the first string that looks
@@ -466,7 +434,6 @@ def _find_image_url(obj):
                 return found
     return None
 
-
 async def call_freetochat_api(model: str, prompt: str):
     """Returns (image_url, error_message) — FreeToChat provider (SSE stream).
 
@@ -480,8 +447,13 @@ async def call_freetochat_api(model: str, prompt: str):
     """
     hint = FREETOCHAT_MODELS.get(model, model)
     payload = {
-        "model": "nemotron-3-super",
-        "messages": [{"role": "user", "content": f"Make {prompt} with {hint}"}],
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "user",
+                "content": f"Make {prompt} using {hint} image model"
+            }
+        ],
         "stream": True,
         "tools_enabled": False,
         "web_search_enabled": False,
@@ -560,7 +532,6 @@ async def call_freetochat_api(model: str, prompt: str):
     except Exception as e:
         return None, f"Unexpected error: {e}"
 
-
 async def generate_image(model: str, prompt: str, size: str):
     """Unified dispatcher. Returns ((kind, payload), error) where kind is
     'url' (FreeToChat) or 'bytes' (CallMissed)."""
@@ -569,7 +540,6 @@ async def generate_image(model: str, prompt: str, size: str):
         return ("url", result), error
     result, error = await call_image_api(model, prompt, size)
     return ("bytes", result), error
-
 
 # ─────────────────────────────  USER HANDLERS  ─────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,7 +553,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_menu_keyboard())
 
-
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_owner(update.effective_user.id):
         return
@@ -596,7 +565,6 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
 
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -607,7 +575,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "gen:start":
         context.user_data.pop("awaiting_prompt", None)
         await query.edit_message_text(
-            "🤖 *Step 1/3 — Choose a model:*", parse_mode=ParseMode.MARKDOWN, reply_markup=models_keyboard()
+            "🤖 *Step 1/2 — Choose a model:*", parse_mode=ParseMode.MARKDOWN, reply_markup=models_keyboard()
         )
         return
 
@@ -619,11 +587,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("model:"):
         model_id = data.split(":", 1)[1]
         context.user_data["model"] = model_id
-        await query.edit_message_text(
-            f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n📐 *Step 2/3 — Choose a size:*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=sizes_keyboard(),
-        )
+
+        # Direct prompts for flux-2-pro and nano-banana-2
+        if model_id in ("flux-2-pro", "nano-banana-2"):
+            context.user_data["awaiting_prompt"] = True
+            await query.edit_message_text(
+                f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n"
+                "✍️ *Step 2/2 — Send your prompt now* as a text message.",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await query.edit_message_text(
+                f"✅ Model: *{MODELS.get(model_id, model_id)}*\n\n📐 *Step 2/3 — Choose a size:*",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=sizes_keyboard(),
+            )
         return
 
     if data.startswith("size:"):
@@ -642,7 +620,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("admin:") and is_owner(user.id):
         await handle_admin_callback(query, context, data)
         return
-
 
 async def handle_admin_callback(query, context, data):
     parts = data.split(":")
@@ -745,7 +722,6 @@ async def handle_admin_callback(query, context, data):
         )
         return
 
-
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg_text = update.message.text or ""
@@ -763,7 +739,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 /start se shuru karo, ya neeche button dabao.", reply_markup=main_menu_keyboard()
     )
-
 
 async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     action = context.user_data.pop("admin_action")
@@ -827,7 +802,6 @@ async def process_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         msg = "⚠️ Invalid format. Try again from the admin menu."
 
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=admin_menu_keyboard())
-
 
 async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
     context.user_data["awaiting_prompt"] = False
@@ -926,7 +900,6 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data.pop("model", None)
     context.user_data.pop("size", None)
 
-
 # ─────────────────────────────  MAIN  ─────────────────────────────
 def main():
     if "PUT_YOUR" in BOT_TOKEN or "PUT_YOUR" in CALLMISSED_API_KEY:
@@ -943,7 +916,6 @@ def main():
 
     log.info(f"{BOT_NAME} starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
