@@ -454,12 +454,13 @@ async def call_freetochat_api(model: str, messages: list, conversation_id: str):
     """Returns (image_url, error_message) — FreeToChat provider (SSE stream).
 
     Uses gpt-4.1 + image-artist always. Does not expose reasoning to the UI.
+    Tools MUST be enabled for the image generation tool to actually execute.
     """
     payload = {
         "model": "gpt-4.1",
         "messages": messages,
         "stream": True,
-        "tools_enabled": False,
+        "tools_enabled": True,
         "web_search_enabled": False,
         "skill": "image-artist",
         "conversation_id": conversation_id,
@@ -518,6 +519,12 @@ async def call_freetochat_api(model: str, messages: list, conversation_id: str):
 
                     # Primary path: documented shape
                     if evt_type == "image_generated":
+                        img_url = _extract_image_url(obj) or _find_image_url(obj)
+                        if img_url:
+                            return img_url, None
+
+                    # Tool result / end events may carry the generated image URL
+                    if evt_type in ("tool_call_result", "tool_call_end", "tool_result"):
                         img_url = _extract_image_url(obj) or _find_image_url(obj)
                         if img_url:
                             return img_url, None
