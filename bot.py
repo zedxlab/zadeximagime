@@ -52,7 +52,7 @@ FREETOCHAT_TOKEN = (
 OWNER_ID = 8558910409
 BOT_NAME = "ZadeXImagine"
 DEV_USERNAME = "zade4everbot"
-DEV_URL = f"https://t.me/{zade4everbotbot}"
+DEV_URL = f"https://t.me/{DEV_USERNAME}"
 
 DEFAULT_DAILY_LIMIT = 5
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zadeximagine.db")
