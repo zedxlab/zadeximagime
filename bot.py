@@ -5,10 +5,6 @@ API: CallMissed (https://api.callmissed.com/v1)
 Run:
     pip install -r requirements.txt
     python bot.py
-
-Token + API key are hardcoded below in CONFIG. API key can also be changed
-live from the admin panel (🔑 Change API Key) — that overrides the hardcoded
-one and is stored in the database, no restart needed.
 """
 
 import asyncio
@@ -35,18 +31,16 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────  CONFIG  ─────────────────────────────
-# 🔑 Hardcode your real values here before running.
 BOT_TOKEN = "8853018550:AAEGf61WdSNdDx7UUOhKT7SNxnqXH4RtXYc"
-CALLMISSED_API_KEY = "cm_HOwWI9nXr_8-isyJ9mfZPgo96BYop4aTHcD9UOKOF1U"  # fallback default — can be overridden live via /admin
+CALLMISSED_API_KEY = "cm_HOwWI9nXr_8-isyJ9mfZPgo96BYop4aTHcD9UOKOF1U"
 API_BASE = "https://api.callmissed.com/v1"
 
-# FreeToChat — used only for flux-2-pro & nano-banana-2 (cheaper/free route)
 FREETOCHAT_URL = "https://api.freetochat.app/api/v1/ai/chat/completions"
 FREETOCHAT_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJlNTEzZWZkZS0zZDEzLTQ0OGEtODkzMy"
     "02NzMxY2JjNzljMTAiLCJyb2xlIjoidXNlciIsImlhdCI6MTc4Mjg0NzQ4NywiZXhwIjoxNzg1NDM5"
     "NDg3fQ.YPqkcOPj_Yyb-ckhRrvFNo_h0lpH2EzxojN9_hHoasc"
-)  # fallback default — can be overridden live via /admin
+)
 
 OWNER_ID = 8558910409
 BOT_NAME = "ZadeXImagine"
@@ -67,8 +61,6 @@ MODELS = {
     "dreamshaper-8-lcm": "🎨 Dreamshaper 8 LCM",
 }
 
-# Models routed through FreeToChat instead of CallMissed, with the exact
-# hint string the router expects appended to the prompt.
 FREETOCHAT_MODELS = {
     "flux-2-pro": "flux pro",
     "nano-banana-2": "nano banana 2",
@@ -80,12 +72,9 @@ SIZES = ["512x512", "768x768", "1024x1024", "1024x1536", "1536x1024"]
 
 HISTORY_PAGE_SIZE = 5
 USERS_PAGE_SIZE = 8
-
-# Conversation history kept for FreeToChat direct models
-MAX_HISTORY_MESSAGES = 10
-
-# Stream edit throttle (seconds)
-STREAM_EDIT_INTERVAL = 0.6
+MAX_HISTORY = 10
+STREAM_EDIT_INTERVAL = 0.5
+MAX_RETRIES = 3
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -381,7 +370,7 @@ def get_history(context: ContextTypes.DEFAULT_TYPE) -> list:
 def add_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str):
     history = get_history(context)
     history.append({"role": role, "content": content})
-    while len(history) > MAX_HISTORY_MESSAGES:
+    while len(history) > MAX_HISTORY:
         history.pop(0)
 
 async def call_image_api(model: str, prompt: str, size: str):
@@ -443,18 +432,14 @@ def _find_image_url(obj):
                 return found
     return None
 
-async def call_freetochat_streaming(
-    model: str,
+async def _stream_once(
     messages: list,
     conversation_id: str,
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
+    stream_msg,
 ):
-    """Stream text to a Telegram message and return image URL when generated.
-
-    Uses kimik2.7-code + default because that is the combination that
-    actually emits the image_generated event on FreeToChat.
-    """
+    """Single streaming attempt. Returns (image_url, streamed_text, error)."""
     payload = {
         "model": "kimi-k2.7-code",
         "messages": messages,
@@ -469,7 +454,6 @@ async def call_freetochat_streaming(
         "Authorization": f"Bearer {get_active_freetochat_token()}",
     }
 
-    stream_msg = await context.bot.send_message(chat_id, "✨ Thinking...")
     streamed_text = ""
     image_url = None
     seen_types = []
@@ -499,7 +483,7 @@ async def call_freetochat_streaming(
             async with client.stream("POST", FREETOCHAT_URL, headers=headers, json=payload) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
-                    return None, None, stream_msg, f"API Error [{resp.status_code}]: {body.decode(errors='ignore')[:300]}"
+                    return None, streamed_text, f"API Error [{resp.status_code}]: {body.decode(errors='ignore')[:300]}"
 
                 current_event = None
                 async for raw_line in resp.aiter_lines():
@@ -537,20 +521,18 @@ async def call_freetochat_streaming(
                             or obj.get("message")
                             or json.dumps(obj)[:300]
                         )
-                        return None, None, stream_msg, f"Provider error: {err_msg}"
+                        return None, streamed_text, f"Provider error: {err_msg}"
 
                     if evt_type == "image_generated":
                         img_url = _extract_image_url(obj) or _find_image_url(obj)
                         if img_url:
                             image_url = img_url
 
-                    # Fallback: image URL may arrive in tool result or content
                     if not image_url and evt_type in ("tool_call_result", "tool_call_end", "tool_result"):
                         img_url = _extract_image_url(obj) or _find_image_url(obj)
                         if img_url:
                             image_url = img_url
 
-                    # Extract text chunks (reasoning + content)
                     choices = obj.get("choices")
                     if isinstance(choices, list) and choices:
                         delta = choices[0].get("delta", {})
@@ -560,14 +542,12 @@ async def call_freetochat_streaming(
                             streamed_text += delta["content"]
                         await maybe_edit()
 
-                    # Also scan any event for an image URL as last resort
                     if not image_url:
                         img_url = _find_image_url(obj)
                         if img_url:
                             image_url = img_url
 
                     if image_url:
-                        # Give a tiny moment for any trailing text, then finish
                         await asyncio.sleep(0.3)
                         await maybe_edit(force=True)
                         break
@@ -576,20 +556,50 @@ async def call_freetochat_streaming(
                     seen = ", ".join(dict.fromkeys(seen_types)) or "none"
                     detail = f" | last data: {last_raw}" if last_raw else ""
                     args_info = f" | tool args: {json.dumps(tool_args)[:200]}" if tool_args else ""
-                    return None, streamed_text, stream_msg, f"No image URL found in stream. Events seen: {seen}{detail}{args_info}"
+                    return None, streamed_text, f"No image URL found in stream. Events seen: {seen}{detail}{args_info}"
 
-                return image_url, streamed_text, stream_msg, None
+                return image_url, streamed_text, None
 
     except httpx.TimeoutException:
-        return None, streamed_text, stream_msg, "⏱ Request timed out. Try again."
+        return None, streamed_text, "⏱ Request timed out. Try again."
     except Exception as e:
-        return None, streamed_text, stream_msg, f"Unexpected error: {e}"
+        return None, streamed_text, f"Unexpected error: {e}"
+
+async def call_freetochat_streaming(
+    model: str,
+    messages: list,
+    conversation_id: str,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+):
+    """Stream with retries. On failure, retry with a fresh conversation."""
+    stream_msg = await context.bot.send_message(chat_id, "✨ Thinking...")
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        use_messages = messages if attempt == 1 else [messages[-1]] if messages else messages
+        use_conv_id = conversation_id if attempt == 1 else str(uuid.uuid4())
+
+        image_url, streamed_text, error = await _stream_once(
+            use_messages, use_conv_id, context, chat_id, stream_msg
+        )
+
+        if image_url:
+            return image_url, streamed_text, stream_msg, None
+
+        if attempt < MAX_RETRIES:
+            try:
+                await stream_msg.edit_text(f"⚠️ Attempt {attempt} failed, retrying...")
+            except Exception:
+                pass
+            await asyncio.sleep(1.5)
+
+    return None, streamed_text, stream_msg, error
 
 async def generate_image(model: str, prompt: str, size: str, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Unified dispatcher. Returns ((kind, payload), stream_msg, error)."""
+    """Unified dispatcher. Returns ((kind, payload), stream_msg, streamed_text, error)."""
     if model in FREETOCHAT_MODELS:
         hint = FREETOCHAT_MODELS[model]
-        user_content = f"Make {prompt} using {hint} image model"
+        user_content = f"Make {prompt} with {hint}"
         add_history(context, "user", user_content)
         messages = get_history(context)
         conversation_id = get_conversation_id(context)
@@ -958,7 +968,6 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     chat_id = update.effective_chat.id
 
-    # Animated status + typing action
     animate_task = asyncio.create_task(
         _animate_status(context, status_msg.chat_id, status_msg.message_id, status_text)
     )
@@ -991,7 +1000,6 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except Exception:
             await status_msg.edit_text(f"❌ Generation failed:\n{safe_error}")
         log_generation(user.id, uname, prompt, model, size, None, "failed", error)
-        # Don't delete stream_msg on error so user can see what was streamed
         try:
             await context.bot.send_message(
                 OWNER_ID,
@@ -1013,7 +1021,6 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     size_line = f"\n📐 {size}" if size and size != "direct" else ""
     caption = f"🖼 *{BOT_NAME}*\n👤 {uname}\n🤖 {MODELS.get(model, model)}{size_line}\n📝 {prompt}"
 
-    # Keep upload_photo alive while Telegram downloads/sends the photo
     upload_task = asyncio.create_task(_keep_upload_action(context, chat_id))
     try:
         photo_arg = result if kind == "url" else BytesIO(result)
@@ -1030,7 +1037,6 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
         except asyncio.CancelledError:
             pass
 
-    # Delete status and streamed text messages after successful image generation
     try:
         await status_msg.delete()
     except Exception:
@@ -1044,7 +1050,6 @@ async def process_generation(update: Update, context: ContextTypes.DEFAULT_TYPE,
     file_id = sent.photo[-1].file_id
     log_generation(user.id, uname, prompt, model, size, file_id, "success")
 
-    # forward to admin
     if user.id != OWNER_ID:
         try:
             await context.bot.send_photo(
