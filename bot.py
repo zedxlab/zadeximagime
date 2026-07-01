@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from datetime import date, datetime
@@ -51,7 +52,7 @@ FREETOCHAT_TOKEN = (
 OWNER_ID = 8558910409
 BOT_NAME = "ZadeXImagine"
 DEV_USERNAME = "zade4everbot"
-DEV_URL = f"https://t.me/{DEV_USERNAME}"
+DEV_URL = f"https://t.me/{zade4everbotbot}"
 
 DEFAULT_DAILY_LIMIT = 5
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zadeximagine.db")
@@ -440,19 +441,47 @@ def _extract_image_url(obj: dict):
     return None
 
 
+IMAGE_URL_RE = re.compile(
+    r'https?://[^\s"\'<>\\]+\.(?:png|jpe?g|webp|gif)(?:\?[^\s"\'<>\\]*)?', re.IGNORECASE
+)
+
+
+def _find_image_url(obj):
+    """Recursively scan a parsed JSON value for the first string that looks
+    like a direct image URL — used as a fallback in case the upstream event
+    name/shape doesn't match the documented 'image_generated' format."""
+    if isinstance(obj, str):
+        m = IMAGE_URL_RE.search(obj)
+        return m.group(0) if m else None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            found = _find_image_url(v)
+            if found:
+                return found
+        return None
+    if isinstance(obj, list):
+        for v in obj:
+            found = _find_image_url(v)
+            if found:
+                return found
+    return None
+
+
 async def call_freetochat_api(model: str, prompt: str):
     """Returns (image_url, error_message) — FreeToChat provider (SSE stream).
 
-    Parsing is deliberately tolerant: the documented format pairs an
-    `event:` line with a `data:` line carrying a matching `"type"` field,
-    but we trust the JSON `"type"` field first and only fall back to the
-    `event:` line, since real-world SSE servers are often inconsistent
-    about emitting the `event:` line at all.
+    Parsing is deliberately tolerant: rather than requiring an exact
+    `type == "image_generated"` match, every parsed event is scanned
+    (recursively) for any string that looks like a direct image URL. This
+    survives the upstream using a different event name/shape than the
+    documented one (e.g. a `tool_call_end`/`tool_call_result` event instead
+    of `image_generated`), as long as the URL itself shows up somewhere in
+    the payload.
     """
     hint = FREETOCHAT_MODELS.get(model, model)
     payload = {
         "model": "nemotron-3-super",
-        "messages": [{"role": "user", "content": f"Generate an image: {prompt} with {hint}"}],
+        "messages": [{"role": "user", "content": f"Make {prompt} with {hint}"}],
         "stream": True,
         "tools_enabled": False,
         "web_search_enabled": False,
@@ -464,6 +493,7 @@ async def call_freetochat_api(model: str, prompt: str):
         "Authorization": f"Bearer {get_active_freetochat_token()}",
     }
     seen_types = []
+    tool_args = None
     last_raw = None
     try:
         async with httpx.AsyncClient(timeout=180) as client:
@@ -499,7 +529,10 @@ async def call_freetochat_api(model: str, prompt: str):
                     if evt_type:
                         seen_types.append(evt_type)
 
-                    if evt_type == "error":
+                    if evt_type == "tool_call_start" and tool_args is None:
+                        tool_args = (obj.get("data") or {}).get("args")
+
+                    if evt_type == "error" or (isinstance(obj, dict) and "error" in obj and evt_type is None):
                         err_msg = (
                             (obj.get("data") or {}).get("message")
                             or obj.get("message")
@@ -507,14 +540,21 @@ async def call_freetochat_api(model: str, prompt: str):
                         )
                         return None, f"Provider error: {err_msg}"
 
+                    # Primary path: documented shape
                     if evt_type == "image_generated":
-                        img_url = _extract_image_url(obj)
+                        img_url = _extract_image_url(obj) or _find_image_url(obj)
                         if img_url:
                             return img_url, None
 
+                    # Fallback path: any event carrying an image URL, regardless of type name
+                    img_url = _find_image_url(obj)
+                    if img_url:
+                        return img_url, None
+
                 seen = ", ".join(dict.fromkeys(seen_types)) or "none"
                 detail = f" | last data: {last_raw}" if last_raw else ""
-                return None, f"No image returned (stream ended without image_generated event). Events seen: {seen}{detail}"
+                args_info = f" | tool args: {json.dumps(tool_args)[:200]}" if tool_args else ""
+                return None, f"No image URL found in stream. Events seen: {seen}{detail}{args_info}"
     except httpx.TimeoutException:
         return None, "⏱ Request timed out. Try again."
     except Exception as e:
